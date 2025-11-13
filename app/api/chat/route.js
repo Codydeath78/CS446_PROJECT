@@ -1,112 +1,189 @@
-// app/api/chat/route.js  (Next.js app router style)
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import fetch from "node-fetch"; // node 18+ already has fetch, but keep for clarity
-import { Firestore } from "@google-cloud/firestore";
+import { Firestore, FieldValue } from "@google-cloud/firestore";
 
-require('dotenv').config();
-
-const systemPrompt = 'Welcome to chatbot INC.! your go-to platform for real-time AI-powered conversations. Hello, how can I help you?';
-
-// env vars
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DETECTOR_URL = process.env.DETECTOR_URL; // e.g. https://<your-cloud-run>.run.app/detect
-const GOOGLE_PROJECT_ID = process.env.GOOGLE_PROJECT_ID; // for Firestore logging
+const OPENAI_API_KEY    = process.env.OPENAI_API_KEY || "";
+const SECRET_STRING     = (process.env.SECRET_STRING || "").trim();
+const DETECTOR_URL_ENV  = (process.env.DETECTOR_URL || "").trim();
+const DETECTOR_URL      = DETECTOR_URL_ENV.endsWith("/detect")
+  ? DETECTOR_URL_ENV
+  : `${DETECTOR_URL_ENV.replace(/\/$/, "")}/detect`;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// initialize Firestore (only if you're using it)
-let firestore;
-if (GOOGLE_PROJECT_ID) {
-  firestore = new Firestore({ projectId: GOOGLE_PROJECT_ID });
+let firestore = null;
+try {
+  firestore = new Firestore();
+  console.log("[Firestore] Initialized with ADC");
+} catch (e) {
+  console.error("[Firestore] init failed:", e);
+}
+
+const systemPrompt =
+  "Welcome to chatbot INC.! your go-to platform for real-time AI-powered conversations. Hello, how can I help you?";
+
+async function runDetector(text) {
+  if (!DETECTOR_URL || !SECRET_STRING || !text?.trim()) return null;
+  try {
+    const r = await fetch(DETECTOR_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": SECRET_STRING,
+      },
+      body: JSON.stringify({ response_text: text }),
+    });
+    if (!r.ok) {
+      console.warn("[Detector] Non-OK:", r.status, await r.text());
+      return null;
+    }
+    return await r.json(); // { bias_detected, confidence_scores, temperature, threshold, ... }
+  } catch (e) {
+    console.warn("[Detector] failed:", e?.message || e);
+    return null;
+  }
+}
+
+async function rephraseUnsafeText(text) {
+  const res = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.3,
+    messages: [
+      {
+        role: "system",
+        content:
+          "Rewrite the user's text to remove biased, discriminatory, or harmful phrasing while preserving intent and meaning. Keep it concise and neutral."
+      },
+      { role: "user", content: `Rewrite safely:\n\n${text}` }
+    ]
+  });
+  return res.choices?.[0]?.message?.content ?? text;
+}
+
+async function logSafety({ preview, scores, source, rephrased }) {
+  if (!firestore) return;
+  try {
+    await firestore.collection("safetyEvents").add({
+      createdAt: FieldValue.serverTimestamp(),
+      source: source || "assistant",                 // "user" | "assistant"
+      preview: (preview || "").slice(0, 2000),
+      rephrased: (rephrased || "").slice(0, 2000),
+      detector: { unsafe: true, scores: scores || {} },
+      openaiModel: "gpt-4o",
+    });
+    console.log("[Firestore] safetyEvents write OK");
+  } catch (e) {
+    console.error("[Firestore] safetyEvents write FAILED:", e?.message || e);
+  }
+}
+
+function streamText(text, meta = {}) {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    start(c) { c.enqueue(enc.encode(text)); c.close(); }
+  });
+
+  const headers = {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+  };
+
+
+  if (meta.rephrased) headers["x-safety"] = meta.source || "assistant"; // "user"|"assistant"
+  if (meta.scores)    headers["x-safety-scores"] = JSON.stringify(meta.scores);
+  if (meta.reason)    headers["x-safety-reason"] = meta.reason; // short string
+
+
+  //show the original text before rephrase (trim and sanitize)
+  if (meta.original) {
+    const original = String(meta.original).slice(0, 1200); // cap for safety/UI
+    headers["x-safety-original"] = original.replace(/\r?\n/g, "\\n");
+  }
+
+
+  //pass through any additional x-* headers you included in meta
+  for (const [k, v] of Object.entries(meta)) {
+    if (k.toLowerCase().startsWith("x-")) headers[k] = v;
+  }
+
+  return new NextResponse(stream, { headers });
 }
 
 export async function POST(req) {
   try {
-    const data = await req.json(); // expect messages array from client
-    const messages = Array.isArray(data) ? [{ role: "system", content: systemPrompt }, ...data] : [{ role: "system", content: systemPrompt }];
+    const body = await req.json();
+    const incoming = Array.isArray(body) ? body : body?.messages || [];
+    const messages = [{ role: "system", content: systemPrompt }, ...incoming];
 
-    // Request a streaming completion from OpenAI (gpt-4o stream)
+    // 1) Check the latest USER message
+    const lastUser = [...incoming].reverse().find(m => m?.role === "user")?.content || "";
+    const detUser = await runDetector(lastUser);
+    // user message flagged
+    if (detUser?.bias_detected) {
+      const safeUser = await rephraseUnsafeText(lastUser);
+      // log asynchronously; do not await to keep the UX snappy
+      logSafety({
+        source: "user",
+        preview: lastUser,
+        rephrased: safeUser,
+        scores: detUser.confidence_scores
+      });
+      // Show the rephrased input back to the user as the assistant’s visible reply
+      //return streamText(safeUser);
+      return streamText(safeUser, {
+        rephrased: true,
+        source: "user",
+        scores: detUser.confidence_scores,
+        reason: "User message rephrased for safety",
+        original: lastUser, //include original user text for UI display
+        "x-moderation-action": "rephrased-user",
+        "x-moderation-reason": "bias_detected",
+      });
+    }
+
+    // 2) Generate assistant draft
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: "gpt-4o",
       messages,
       stream: true,
     });
 
-    // Buffer all streamed tokens into `fullText`
-    let fullText = '';
+    let fullText = "";
     for await (const chunk of completion) {
-      // chunk.choices[0].delta.content may be undefined for some deltas
       const part = chunk.choices?.[0]?.delta?.content;
       if (part) fullText += part;
     }
 
-    // Call detection service with fullText
-    const detectorResp = await fetch(DETECTOR_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        response_text: fullText,
-        // optional: send conversation context (anonymize user IDs first)
-        // conversation: messages,
-      }),
-    });
-
-    if (!detectorResp.ok) {
-      // If detector failed, fallback to safe behavior: return original text
-      console.error('Detector call failed', await detectorResp.text());
-      return createStreamedResponse(fullText);
+    // 3) Check assistant draft
+    const detAsst = await runDetector(fullText);
+    // assistant draft flagged
+    if (detAsst?.bias_detected) {
+      const safeReply = await rephraseUnsafeText(fullText);
+      logSafety({
+        source: "assistant",
+        preview: fullText,
+        rephrased: safeReply,
+        scores: detAsst.confidence_scores
+      });
+      //return streamText(safeReply);
+      return streamText(safeReply, {
+        rephrased: true,
+        source: "assistant",
+        scores: detAsst.confidence_scores,
+        reason: "Assistant reply rephrased for safety",
+        original: fullText, //include original assistant text for UI display
+        "x-moderation-action": "rephrased-assistant",
+        "x-moderation-reason": "bias_detected",
+      });
     }
 
-    const det = await detectorResp.json();
-    // expected det = { flagged: bool, action: 'pass'|'rephrase'|'block'|'human_review', confidence: 0.x, rephrase_text?: string, metadata?: {...} }
-
-    // Log flag metadata to Firestore (if flagged)
-    if (det.flagged && firestore) {
-      try {
-        const doc = {
-          timestamp: new Date().toISOString(),
-          flagged: det.flagged,
-          action: det.action,
-          confidence: det.confidence,
-          // keep conversation anonymized
-          preview: fullText.slice(0, 512),
-          metadata: det.metadata || {},
-        };
-        await firestore.collection('bias_flags').add(doc);
-      } catch (e) {
-        console.error('Failed to log to Firestore', e);
-      }
-    }
-
-    // Decide what to return
-    if (det.action === 'rephrase' && det.rephrase_text) {
-      return createStreamedResponse(det.rephrase_text);
-    } else if (det.action === 'block') {
-      const blockedMessage = "Sorry — this response was flagged as potentially inappropriate and cannot be shown.";
-      return createStreamedResponse(blockedMessage);
-    } else if (det.action === 'human_review') {
-      const underReview = "This response is under review for safety. Please try again later or edit your question.";
-      return createStreamedResponse(underReview);
-    } else {
-      // pass
-      return createStreamedResponse(fullText);
-    }
-
+    // 4) Safe reply
+    return streamText(fullText);
   } catch (err) {
     console.error(err);
-    return NextResponse.json({ error: 'Server error' }, { status: 500 });
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
-}
-
-// helper that streams a text as a ReadableStream (so client code expecting streaming will still work)
-function createStreamedResponse(text) {
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(encoder.encode(text));
-      controller.close();
-    },
-  });
-  return new NextResponse(stream);
 }

@@ -8,6 +8,10 @@ import { createTheme, ThemeProvider } from "@mui/material/styles";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import { motion, AnimatePresence } from "framer-motion";
+import ShieldRoundedIcon from "@mui/icons-material/ShieldRounded";
+import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
+import { Snackbar, Alert, Slide, Popover } from "@mui/material";
 
 export default function Home() {
   const [messages, setMessages] = useState([
@@ -24,10 +28,59 @@ export default function Home() {
     return localStorage.getItem("chat-ui-mode") || "light";
   });
 
+  const [toast, setToast] = useState({ open: false, msg: "" });
+  // Compare popover state
+  const [compareAnchor, setCompareAnchor] = useState(null);
+  const [compareData, setCompareData] = useState({ before: "", after: "" });
+  const [compareTab, setCompareTab] = useState("after"); // "before" | "after"
+
+
+  let _DiffLib = null;
+  async function getDiffLib() {
+    if (_DiffLib) return _DiffLib;
+    _DiffLib = await import("diff");
+    return _DiffLib;
+  }
+
+  // Build “parts” = [{added?, removed?, value}]
+  async function buildDiffParts(before, after) {
+    const Diff = await getDiffLib();
+    // word diff that keeps spaces = better phrase readability
+    const parts = Diff.diffWordsWithSpace(before || "", after || "", { ignoreCase: false });
+    return parts;
+  }
+
+
+  function openCompare(e, before, after) {
+    setCompareAnchor({ top: e.clientY, left: e.clientX });
+    setCompareData({ before, after });
+    setCompareTab("before");
+    // kick off diff calc (async) and stash on compareData without breaking UI
+    buildDiffParts(before, after).then((parts) => {
+    setCompareData((d) => ({ ...d, parts }));
+    }).catch(() => {});
+  }
+
+
+  function closeCompare() {
+    setCompareAnchor(null);
+  }
+
+
+
+  function showToast(msg) {
+    setToast({ open: true, msg });
+    // hard-close after 1.2s even if the Snackbar’s timer is paused
+    setTimeout(() => setToast({ open: false, msg: "" }), 1200);
+  }
+
+  function TransitionUp(props) {
+    return <Slide {...props} direction="up" />;
+  }
   const scrollRef = useRef(null);
   const playedReceiveRef = useRef(false);
 
-  // --- Sound effects (no external files; Web Audio API beeps) ---
+  //sound effects
   const playSound = (type) => {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -71,50 +124,121 @@ export default function Home() {
   }), [mode]);
 
   const sendMessage = async () => {
-    if (!message.trim()) return;
-    const userMsg = { role: "user", content: message, createdAt: Date.now() };
-    setMessage("");
-    setIsSending(true);
-    playedReceiveRef.current = false;
-    setMessages((m) => [...m, userMsg, { role: "assistant", content: "", createdAt: Date.now() }]);
-    playSound("send");
+  if (!message.trim()) return;
 
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify([...messages, userMsg]),
-      });
+  const userMsg = { role: "user", content: message, createdAt: Date.now() };
+  setMessage("");
+  setIsSending(true);
+  playedReceiveRef.current = false;
 
-      if (!res.body) throw new Error("No response body");
+  // 1) Append ONLY the user message first
+  setMessages((m) => [...m, userMsg]);
+  playSound("send");
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify([...messages, userMsg]),
+    });
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
+    if (!res.body) throw new Error("No response body");
+
+    // 2) Read moderation headers and decide if we should delay showing assistant
+    const action = (res.headers.get("x-moderation-action") || "").toLowerCase();
+    const safety = res.headers.get("x-safety"); // null | "user" | "assistant"
+    let safetyScores = null;
+    try { safetyScores = JSON.parse(res.headers.get("x-safety-scores") || "null"); } catch {}
+    const safetyReason = res.headers.get("x-safety-reason") || null;
+
+    //original text before rephrase
+    const safetyOriginal = res.headers.get("x-safety-original") || null;
+
+    let delayMs = 0;
+    if (action.startsWith("rephrased-user")) {
+      delayMs = 1200;
+      showToast("Moderator detected biased phrasing — rewriting your message…");
+    } else if (action.startsWith("rephrased-assistant")) {
+      delayMs = 1200;
+      showToast("Moderator detected biased phrasing — rewriting assistant draft…");
+    } else if (action.startsWith("blocked")) {
+      delayMs = 1200;
+      showToast("Moderator blocked unsafe content.");
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    // 3) Stream, but buffer until the delay is over, then create the assistant bubble once
+    let buffer = "";
+    let assistantShown = false;
+    const unblockAt = Date.now() + delayMs;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      buffer += chunk;
+
+      // if it's time to reveal the assistant bubble
+      if (!assistantShown && Date.now() >= unblockAt) {
+        setMessages((msgs) => [
+          ...msgs,
+          {
+            role: "assistant",
+            content: buffer,
+            createdAt: Date.now(),
+            // attach safety flags on creation so tooltip works
+            ...(safety ? { safety, safetyScores, safetyReason, safetyOriginal } : {}),
+          },
+        ]);
+        assistantShown = true;
+
+        if (!playedReceiveRef.current) {
+          playedReceiveRef.current = true;
+          playSound("receive");
+        }
+      } else if (assistantShown) {
+        // update the last assistant bubble as more chunks arrive
         setMessages((msgs) => {
           const last = msgs[msgs.length - 1];
-          const rest = msgs.slice(0, msgs.length - 1);
-          // play receive sound once when first chunk lands
-          if (!playedReceiveRef.current) {
-            playedReceiveRef.current = true;
-            playSound("receive");
-          }
+          const rest = msgs.slice(0, -1);
           return [...rest, { ...last, content: last.content + chunk }];
         });
       }
-    } catch (e) {
-      setMessages((m) => [
-        ...m.slice(0, -1),
-        { role: "assistant", content: "Oops—I hit a snag while replying. Try again?", createdAt: Date.now() },
-      ]);
-    } finally {
-      setIsSending(false);
     }
-  };
+
+    // 4) Edge case: very short responses may finish before unblock time
+    if (!assistantShown) {
+      // wait out any remaining delay
+      const remain = unblockAt - Date.now();
+      if (remain > 0) await new Promise((r) => setTimeout(r, remain));
+
+      setMessages((msgs) => [
+        ...msgs,
+        {
+          role: "assistant",
+          content: buffer,
+          createdAt: Date.now(),
+          ...(safety ? { safety, safetyScores, safetyReason, safetyOriginal } : {}),
+        },
+      ]);
+
+      if (!playedReceiveRef.current) {
+        playedReceiveRef.current = true;
+        playSound("receive");
+      }
+    }
+  } catch (e) {
+    setMessages((m) => [
+      ...m,
+      { role: "assistant", content: "Oops—I hit a snag while replying. Try again?", createdAt: Date.now() },
+    ]);
+  } finally {
+    setIsSending(false);
+  }
+};
 
   const bubbleVariants = {
     initialLeft: { opacity: 0, x: -16, filter: "blur(4px)" },
@@ -238,6 +362,135 @@ export default function Home() {
                         ) : (
                           <>
                             <Markdown>{m.content}</Markdown>
+
+                            {/* safety badge (only when rephrased) */}
+                            {m.safety && (
+                              <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mt: 0.75 }}>
+                                {/* Shield icon (visual affordance) */}
+                                <ShieldRoundedIcon
+                                  fontSize="small"
+                                  sx={{ opacity: 0.9 }}
+                                  aria-label="Safety moderation applied"
+                                />
+
+                                {/* Info icon so Detector scores */}
+                                <Tooltip
+                                  title={
+                                    <Box sx={{ maxWidth: 280 }}>
+                                      <Box sx={{ fontWeight: 700, mb: 0.5 }}>Detector scores</Box>
+                                      <Box sx={{ fontSize: 12, opacity: 0.9 }}>
+                                        {m.safetyScores
+                                          ? (
+                                            <>
+                                              biased: {Number(m.safetyScores.biased).toFixed(3)} | neutral: {Number(m.safetyScores.neutral).toFixed(3)}
+                                              {/* small confidence meter */}
+<Box
+  sx={{
+    mt: 1,
+    width: 60,
+    height: 6,
+    display: "flex",
+    borderRadius: 999,
+    overflow: "hidden",
+    border: "1px solid rgba(0,0,0,0.2)",
+  }}
+>
+  <Box
+    sx={{
+      width: `${Math.round(Number(m.safetyScores.biased) * 100)}%`,
+      bgcolor: "rgba(236,72,153,0.9)", // pink/red biased side
+      transition: "width 0.3s",
+    }}
+  />
+  <Box
+    sx={{
+      flexGrow: 1,
+      bgcolor: "rgba(56,189,248,0.35)", // cyan neutral side
+    }}
+  />
+</Box>
+
+                                            </>
+                                          )
+                                          : "Scores unavailable."
+                                        }
+                                      </Box>
+                                    </Box>
+                                  }
+                                  arrow
+                                >
+                                  <InfoOutlinedIcon
+                                    fontSize="small"
+                                    sx={{ opacity: 0.85, cursor: "help" }}
+                                    aria-label="Detector scores"
+                                  />
+                                </Tooltip>
+
+                                {/* Warning icon so Reason and Original (before rephrase) */}
+    <Tooltip
+      title={
+        <Box sx={{ maxWidth: 320 }}>
+          <Box sx={{ fontWeight: 700, mb: 0.5 }}>
+            {m.safety === "user" ? "Why your message was rephrased" : "Why assistant reply was rephrased"}
+          </Box>
+          <Box sx={{ fontSize: 12, opacity: 0.9, mb: 0.75 }}>
+            {m.safetyReason || "Flagged by moderator to keep the conversation safe."}
+          </Box>
+          {m.safetyOriginal && (
+            <>
+              <Box sx={{ fontWeight: 700, mb: 0.25, fontSize: 12 }}>Original (before rephrase)</Box>
+              <Box
+                component="pre"
+                sx={{
+                  m: 0,
+                  p: 1,
+                  fontSize: 12,
+                  lineHeight: 1.35,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                  maxHeight: 180,
+                  overflow: "auto",
+                  bgcolor: "rgba(0,0,0,0.06)",
+                  borderRadius: 1,
+                }}
+              >
+                {m.safetyOriginal}
+              </Box>
+
+              {/* Compare (Before / After) link */}
+          <Box sx={{ mt: 0.75, textAlign: "right" }}>
+            <Button
+              size="small"
+              variant="text"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openCompare(e, m.safetyOriginal || "", m.content || "");
+              }}
+              sx={{ textTransform: "none", fontSize: 12, px: 0.5, minWidth: "auto" }}
+            >
+              Compare (Before / After)
+            </Button>
+          </Box>
+            </>
+          )}
+        </Box>
+      }
+      arrow
+    >
+      <WarningAmberRoundedIcon
+        fontSize="small"
+        sx={{ opacity: 0.9, cursor: "help" }}
+        aria-label="Reason & original text"
+      />
+    </Tooltip>
+
+                                <Box sx={{ fontSize: 12, opacity: 0.7 }}>
+                                  Rephrased for safety
+                                </Box>
+                              </Box>
+                            )}
+
                             <Box sx={{ mt: 0.5, fontSize: 11, opacity: 0.6, textAlign: isAssistant ? "left" : "right" }}>
                               {formatTime(m.createdAt)}
                             </Box>
@@ -306,6 +559,148 @@ export default function Home() {
           </Box>
         </Box>
       </Box>
+      <Snackbar
+        open={toast.open}
+        slots={{ transition: TransitionUp }}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        autoHideDuration={1200}
+        onClose={() => setToast({ open: false, msg: "" })}
+        sx={{ zIndex: 9999 }}
+      >
+        <Alert
+          elevation={0}
+          severity="info"
+          sx={{
+            borderRadius: 999,
+            px: 2,
+            py: 0.5,
+            fontSize: 13,
+            backdropFilter: "blur(8px)",
+            bgcolor: mode === "light" ? "rgba(99,102,241,0.12)" : "rgba(99,102,241,0.2)",
+            border: "1px solid rgba(99,102,241,0.35)"
+          }}
+        >
+          {toast.msg}
+        </Alert>
+      </Snackbar>
+
+      <Popover
+  open={Boolean(compareAnchor)}
+  anchorEl={null}
+  anchorReference="anchorPosition"
+  anchorPosition={compareAnchor || { top: 0, left: 0 }}
+  onClose={closeCompare}
+  anchorOrigin={{ vertical: "top", horizontal: "center" }}
+  transformOrigin={{ vertical: "bottom", horizontal: "center" }}
+  slotProps={{
+    paper: {
+      sx: {
+        p: 1.5,
+        maxWidth: 420,
+        width: 420,
+        borderRadius: 2,
+        boxShadow: mode === "light" ? 4 : 8,
+        bgcolor: mode === "light" ? "#fff" : "#0f172a",
+        border: "1px solid",
+        borderColor: mode === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.12)",
+      },
+    },
+  }}
+>
+  <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", mb: 1 }}>
+    <Box sx={{ fontWeight: 700 }}>Compare</Box>
+    <Box sx={{ display: "flex", gap: 1 }}>
+      <Button
+        size="small"
+        variant={compareTab === "before" ? "contained" : "text"}
+        onClick={() => setCompareTab("before")}
+        sx={{ textTransform: "none", minWidth: 64 }}
+      >
+        Before
+      </Button>
+      <Button
+        size="small"
+        variant={compareTab === "after" ? "contained" : "text"}
+        onClick={() => setCompareTab("after")}
+        sx={{ textTransform: "none", minWidth: 64 }}
+      >
+        After
+      </Button>
+    </Box>
+  </Box>
+
+  <Box
+    component="pre"
+    sx={{
+      m: 0,
+      p: 1,
+      borderRadius: 1.5,
+      whiteSpace: "pre-wrap",
+      wordBreak: "break-word",
+      maxHeight: 320,
+      overflow: "auto",
+      bgcolor: mode === "light" ? "rgba(0,0,0,0.04)" : "rgba(255,255,255,0.06)",
+      border: "1px solid",
+      borderColor: mode === "light" ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.12)",
+      fontSize: 13.5,
+    }}
+  >
+       {Array.isArray(compareData.parts)
+     ? compareData.parts.map((p, idx) => {
+         
+         if (compareTab === "after" && p.added) {
+           return (
+             <span
+               key={idx}
+               style={{
+                 background: "rgba(56,189,248,0.28)", // cyan tint
+                 borderRadius: 4,
+                 padding: "0 2px",
+               }}
+             >
+               {p.value}
+             </span>
+           );
+         }
+         
+         if (compareTab === "before" && p.removed) {
+           return (
+             <span
+               key={idx}
+               style={{
+                 background: "rgba(236,72,153,0.28)", // pink/red tint
+                 borderRadius: 4,
+                 textDecoration: "line-through",
+                 padding: "0 2px",
+               }}
+             >
+               {p.value}
+             </span>
+           );
+         }
+         
+         return <span key={idx}>{p.value}</span>;
+       })
+     : (compareTab === "before" ? compareData.before : compareData.after)}
+
+  </Box>
+
+  {/* Nudge: only in Compare popover AND only on After */}
+  {compareTab === "after" && (
+    <Box
+      sx={{
+        mt: 0.75,
+        fontSize: 11.5,
+        color: "text.secondary",
+        opacity: 0.85,
+        fontStyle: "italic",
+      }}
+    >
+      (softened wording applied)
+    </Box>
+  )}
+</Popover>
+
     </ThemeProvider>
   );
 }
