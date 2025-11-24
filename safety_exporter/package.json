@@ -1,0 +1,14 @@
+{
+  "name": "safety-exporter",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.11.0",
+    "@google-cloud/storage": "^7.10.0",
+    "express": "^4.19.0"
+  }
+}

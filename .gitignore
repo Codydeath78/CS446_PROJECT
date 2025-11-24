@@ -2,6 +2,8 @@
 
 # dependencies
 /node_modules
+/modelv2/safety_detector_model
+/bias_faireness_detection_app/safety_exporter/node_modules
 /.pnp
 .pnp.*
 .yarn/*
@@ -32,6 +34,11 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env
+modelv2/
+safety_exporter/
+
+/modelv2/.safety-detector-model
+/safety_exporter/.node_modules
 # vercel
 .vercel
 

@@ -6,7 +6,9 @@ import { Firestore, FieldValue } from '@google-cloud/firestore';
 const GOOGLE_PROJECT_ID = process.env.GOOGLE_PROJECT_ID;
 const firestore = GOOGLE_PROJECT_ID ? new Firestore({ projectId: GOOGLE_PROJECT_ID }) : null;
 
+//test Firestore write
 export async function POST() {
+  //write a test document to Firestore
   try {
     if (!firestore) throw new Error('Firestore not initialized');
     const ref = await firestore.collection('safetyEvents').add({

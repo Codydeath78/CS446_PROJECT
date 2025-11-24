@@ -12,8 +12,14 @@ import ShieldRoundedIcon from "@mui/icons-material/ShieldRounded";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import WarningAmberRoundedIcon from "@mui/icons-material/WarningAmberRounded";
 import { Snackbar, Alert, Slide, Popover } from "@mui/material";
+import { useRouter } from "next/navigation";
 
+//main Chat Page
 export default function Home() {
+  //next.js router
+  const router = useRouter();
+
+  //chat state
   const [messages, setMessages] = useState([
     {
       role: "assistant",
@@ -21,66 +27,73 @@ export default function Home() {
       createdAt: Date.now(),
     },
   ]);
+  //composer state
   const [message, setMessage] = useState("");
+  //sending state
   const [isSending, setIsSending] = useState(false);
+  //theme mode state
   const [mode, setMode] = useState(() => {
     if (typeof window === "undefined") return "light";
     return localStorage.getItem("chat-ui-mode") || "light";
   });
 
+  //toast state
   const [toast, setToast] = useState({ open: false, msg: "" });
-  // Compare popover state
+  //compare popover state
   const [compareAnchor, setCompareAnchor] = useState(null);
+  //compare data state
   const [compareData, setCompareData] = useState({ before: "", after: "" });
+  //compare tab state
   const [compareTab, setCompareTab] = useState("after"); // "before" | "after"
 
-
+  // dynamically import diff library
   let _DiffLib = null;
   async function getDiffLib() {
     if (_DiffLib) return _DiffLib;
     _DiffLib = await import("diff");
     return _DiffLib;
   }
-
-  // Build “parts” = [{added?, removed?, value}]
+  //construct diff parts for before/after comparison
+  //build “parts” = [{added?, removed?, value}]
   async function buildDiffParts(before, after) {
     const Diff = await getDiffLib();
-    // word diff that keeps spaces = better phrase readability
+    //word diff that keeps spaces means better phrase readability
     const parts = Diff.diffWordsWithSpace(before || "", after || "", { ignoreCase: false });
     return parts;
   }
 
-
+  //open compare popover
   function openCompare(e, before, after) {
     setCompareAnchor({ top: e.clientY, left: e.clientX });
     setCompareData({ before, after });
     setCompareTab("before");
-    // kick off diff calc (async) and stash on compareData without breaking UI
     buildDiffParts(before, after).then((parts) => {
     setCompareData((d) => ({ ...d, parts }));
     }).catch(() => {});
   }
 
-
+  //close compare popover
   function closeCompare() {
     setCompareAnchor(null);
   }
 
 
-
+  //show toast message
   function showToast(msg) {
     setToast({ open: true, msg });
-    // hard-close after 1.2s even if the Snackbar’s timer is paused
+    //hard-close after 1.2s even if the Snackbar’s timer is paused
     setTimeout(() => setToast({ open: false, msg: "" }), 1200);
   }
-
+  //snackbar transition
   function TransitionUp(props) {
     return <Slide {...props} direction="up" />;
   }
+  //scroll ref
   const scrollRef = useRef(null);
+  //ref to track if receive sound played
   const playedReceiveRef = useRef(false);
 
-  //sound effects
+  //play sound effect
   const playSound = (type) => {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -99,7 +112,7 @@ export default function Home() {
     } catch {}
   };
 
-  // Auto-scroll to the latest message
+  //auto-scroll to the latest message
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -111,6 +124,7 @@ export default function Home() {
     if (typeof window !== "undefined") localStorage.setItem("chat-ui-mode", mode);
   }, [mode]);
 
+  //create MUI theme
   const theme = useMemo(() => createTheme({
     palette: {
       mode,
@@ -123,6 +137,7 @@ export default function Home() {
     shape: { borderRadius: 16 },
   }), [mode]);
 
+  //send message handler
   const sendMessage = async () => {
   if (!message.trim()) return;
 
@@ -131,10 +146,11 @@ export default function Home() {
   setIsSending(true);
   playedReceiveRef.current = false;
 
-  // 1) Append ONLY the user message first
+  //append only the user message first
   setMessages((m) => [...m, userMsg]);
   playSound("send");
 
+  //call the API to get assistant response stream
   try {
     const res = await fetch("/api/chat", {
       method: "POST",
@@ -144,7 +160,7 @@ export default function Home() {
 
     if (!res.body) throw new Error("No response body");
 
-    // 2) Read moderation headers and decide if we should delay showing assistant
+    //read moderation headers and decide if we should delay showing assistant
     const action = (res.headers.get("x-moderation-action") || "").toLowerCase();
     const safety = res.headers.get("x-safety"); // null | "user" | "assistant"
     let safetyScores = null;
@@ -169,11 +185,12 @@ export default function Home() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
 
-    // 3) Stream, but buffer until the delay is over, then create the assistant bubble once
+    //stream, but buffer until the delay is over, then create the assistant bubble once
     let buffer = "";
     let assistantShown = false;
     const unblockAt = Date.now() + delayMs;
 
+    //read the streaming chunks
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -181,7 +198,7 @@ export default function Home() {
       const chunk = decoder.decode(value, { stream: true });
       buffer += chunk;
 
-      // if it's time to reveal the assistant bubble
+      //if it's time to reveal the assistant bubble
       if (!assistantShown && Date.now() >= unblockAt) {
         setMessages((msgs) => [
           ...msgs,
@@ -189,18 +206,18 @@ export default function Home() {
             role: "assistant",
             content: buffer,
             createdAt: Date.now(),
-            // attach safety flags on creation so tooltip works
+            //attach safety flags on creation so tooltip works
             ...(safety ? { safety, safetyScores, safetyReason, safetyOriginal } : {}),
           },
         ]);
         assistantShown = true;
-
+        // play receive sound
         if (!playedReceiveRef.current) {
           playedReceiveRef.current = true;
           playSound("receive");
         }
       } else if (assistantShown) {
-        // update the last assistant bubble as more chunks arrive
+        //update the last assistant bubble as more chunks arrive
         setMessages((msgs) => {
           const last = msgs[msgs.length - 1];
           const rest = msgs.slice(0, -1);
@@ -209,12 +226,12 @@ export default function Home() {
       }
     }
 
-    // 4) Edge case: very short responses may finish before unblock time
+    //edge case: very short responses may finish before unblock time
     if (!assistantShown) {
-      // wait out any remaining delay
+      //wait out any remaining delay
       const remain = unblockAt - Date.now();
       if (remain > 0) await new Promise((r) => setTimeout(r, remain));
-
+      //finally show the assistant message
       setMessages((msgs) => [
         ...msgs,
         {
@@ -224,7 +241,7 @@ export default function Home() {
           ...(safety ? { safety, safetyScores, safetyReason, safetyOriginal } : {}),
         },
       ]);
-
+      // play receive sound
       if (!playedReceiveRef.current) {
         playedReceiveRef.current = true;
         playSound("receive");
@@ -239,21 +256,21 @@ export default function Home() {
     setIsSending(false);
   }
 };
-
+  //animation variants for message bubbles
   const bubbleVariants = {
     initialLeft: { opacity: 0, x: -16, filter: "blur(4px)" },
     initialRight: { opacity: 0, x: 16, filter: "blur(4px)" },
     animate: { opacity: 1, x: 0, filter: "blur(0px)", transition: { type: "spring", stiffness: 380, damping: 28 } },
     exit: { opacity: 0, y: 12, scale: 0.98, transition: { duration: 0.18 } },
   };
-
+  //format timestamp to HH:MM
   const formatTime = (ts) => {
     const d = new Date(ts);
     const hh = String(d.getHours()).padStart(2, "0");
     const mm = String(d.getMinutes()).padStart(2, "0");
     return `${hh}:${mm}`;
   };
-
+  //typing dots component
   const TypingDots = () => (
     <Box sx={{ display: "flex", gap: 0.8, alignItems: "center", py: 0.5 }}>
       {[0, 1, 2].map((i) => (
@@ -303,7 +320,7 @@ export default function Home() {
             background: theme.palette.background.paper,
           }}
         >
-          {/* Header */}
+          {/* header */}
           <Box
             sx={{
               px: 2.5,
@@ -325,10 +342,30 @@ export default function Home() {
                   {mode === "light" ? <DarkModeRoundedIcon /> : <LightModeRoundedIcon />}
                 </IconButton>
               </Tooltip>
+
+              {/*button to open review UI */}
+              <Tooltip title="Open reviewer UI">
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={() => router.push("/review")}
+                  sx={{
+                    textTransform: "none",
+                    ml: 0.5,
+                    borderRadius: 999,
+                    px: 1.5,
+                    py: 0.25,
+                    fontSize: 12,
+                  }}
+                >
+                  Review
+                </Button>
+              </Tooltip>
+            
             </Box>
           </Box>
 
-          {/* Messages */}
+          {/* messages */}
           <Stack ref={scrollRef} direction="column" spacing={1.25} sx={{ flexGrow: 1, overflow: "auto", p: 2, scrollBehavior: "smooth" }}>
             <AnimatePresence initial={false}>
               {messages.map((m, i) => {
@@ -363,17 +400,17 @@ export default function Home() {
                           <>
                             <Markdown>{m.content}</Markdown>
 
-                            {/* safety badge (only when rephrased) */}
+                            {/*safety badge (only when rephrased) */}
                             {m.safety && (
                               <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mt: 0.75 }}>
-                                {/* Shield icon (visual affordance) */}
+                                {/* Shield icon (visual) */}
                                 <ShieldRoundedIcon
                                   fontSize="small"
                                   sx={{ opacity: 0.9 }}
                                   aria-label="Safety moderation applied"
                                 />
 
-                                {/* Info icon so Detector scores */}
+                                {/*info icon so Detector scores */}
                                 <Tooltip
                                   title={
                                     <Box sx={{ maxWidth: 280 }}>
@@ -383,7 +420,7 @@ export default function Home() {
                                           ? (
                                             <>
                                               biased: {Number(m.safetyScores.biased).toFixed(3)} | neutral: {Number(m.safetyScores.neutral).toFixed(3)}
-                                              {/* small confidence meter */}
+{/* small confidence meter */}
 <Box
   sx={{
     mt: 1,
@@ -398,35 +435,33 @@ export default function Home() {
   <Box
     sx={{
       width: `${Math.round(Number(m.safetyScores.biased) * 100)}%`,
-      bgcolor: "rgba(236,72,153,0.9)", // pink/red biased side
+      bgcolor: "rgba(236,72,153,0.9)", //pink/red biased side
       transition: "width 0.3s",
     }}
   />
   <Box
     sx={{
       flexGrow: 1,
-      bgcolor: "rgba(56,189,248,0.35)", // cyan neutral side
+      bgcolor: "rgba(56,189,248,0.35)", //cyan neutral side
     }}
   />
 </Box>
-
-                                            </>
-                                          )
-                                          : "Scores unavailable."
-                                        }
-                                      </Box>
-                                    </Box>
-                                  }
-                                  arrow
-                                >
-                                  <InfoOutlinedIcon
-                                    fontSize="small"
-                                    sx={{ opacity: 0.85, cursor: "help" }}
-                                    aria-label="Detector scores"
-                                  />
-                                </Tooltip>
-
-                                {/* Warning icon so Reason and Original (before rephrase) */}
+  </>
+    )
+     : "Scores unavailable."
+      }
+       </Box>
+         </Box>
+           }
+             arrow
+               >
+                 <InfoOutlinedIcon
+                    fontSize="small"
+                      sx={{ opacity: 0.85, cursor: "help" }}
+                        aria-label="Detector scores"
+                          />
+                            </Tooltip>
+{/* warning icon so reason and original (before rephrase) */}
     <Tooltip
       title={
         <Box sx={{ maxWidth: 320 }}>
@@ -457,7 +492,7 @@ export default function Home() {
                 {m.safetyOriginal}
               </Box>
 
-              {/* Compare (Before / After) link */}
+              {/* compare (Before / After) link */}
           <Box sx={{ mt: 0.75, textAlign: "right" }}>
             <Button
               size="small"
@@ -485,17 +520,16 @@ export default function Home() {
       />
     </Tooltip>
 
-                                <Box sx={{ fontSize: 12, opacity: 0.7 }}>
-                                  Rephrased for safety
-                                </Box>
-                              </Box>
-                            )}
-
-                            <Box sx={{ mt: 0.5, fontSize: 11, opacity: 0.6, textAlign: isAssistant ? "left" : "right" }}>
-                              {formatTime(m.createdAt)}
-                            </Box>
-                          </>
-                        )}
+    <Box sx={{ fontSize: 12, opacity: 0.7 }}>
+      Rephrased for safety
+        </Box>
+          </Box>
+            )}
+              <Box sx={{ mt: 0.5, fontSize: 11, opacity: 0.6, textAlign: isAssistant ? "left" : "right" }}>
+                 {formatTime(m.createdAt)}
+                    </Box>
+                      </>
+                      )}
                       </Box>
                     </Box>
                   </Box>
@@ -504,7 +538,7 @@ export default function Home() {
             </AnimatePresence>
           </Stack>
 
-          {/* Composer */}
+          {/* composer */}
           <Box sx={{ p: 2, pt: 1.25, borderTop: "1px solid rgba(0,0,0,0.06)", background: mode === "light" ? "linear-gradient(180deg, rgba(255,255,255,0.65), rgba(255,255,255,0.45))" : "linear-gradient(180deg, rgba(17,24,39,0.85), rgba(17,24,39,0.7))" }}>
             <Stack direction="row" spacing={1} alignItems="center">
               <TextField
@@ -653,7 +687,7 @@ export default function Home() {
              <span
                key={idx}
                style={{
-                 background: "rgba(56,189,248,0.28)", // cyan tint
+                 background: "rgba(56,189,248,0.28)", //cyan tint
                  borderRadius: 4,
                  padding: "0 2px",
                }}
@@ -668,7 +702,7 @@ export default function Home() {
              <span
                key={idx}
                style={{
-                 background: "rgba(236,72,153,0.28)", // pink/red tint
+                 background: "rgba(236,72,153,0.28)", //pink/red tint
                  borderRadius: 4,
                  textDecoration: "line-through",
                  padding: "0 2px",
@@ -685,7 +719,7 @@ export default function Home() {
 
   </Box>
 
-  {/* Nudge: only in Compare popover AND only on After */}
+  {/* only in Compare popover and only on After */}
   {compareTab === "after" && (
     <Box
       sx={{
