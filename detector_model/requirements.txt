@@ -1,0 +1,22 @@
+fastapi
+uvicorn[standard]
+pydantic
+transformers
+torch
+datasets
+accelerate
+evaluate
+
+
+# this is what you need to train detection model version 1
+torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+transformers==4.45.2
+datasets==3.0.2
+evaluate==0.4.3
+accelerate==1.0.1
+sentencepiece==0.2.0
+scipy 
+scikit-learn 
+pandas 
+pyarrow 
+protobuf

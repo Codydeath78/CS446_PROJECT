@@ -38,7 +38,12 @@ modelv2/
 safety_exporter/
 
 /modelv2/.safety-detector-model
-/safety_exporter/.node_modules
+/safety_exporter/.node_modules\
+
+/detector_model/.venv
+/detector_model/__pycache__
+/detector_model/model
+/detector_model/out
 # vercel
 .vercel
 
